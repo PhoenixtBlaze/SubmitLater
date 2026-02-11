@@ -1,6 +1,7 @@
 ﻿using HarmonyLib;
 using System;
 using System.Linq;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
@@ -231,6 +232,17 @@ namespace SubmitLater.HarmonyPatches
 
                         Plugin.Log.Info("[SubmitLater] Pause menu shown - waiting for user input");
 
+                        try
+                        {
+                            // Wait one frame for menu to fully initialize
+                            _ = Gameplay.CoroutineHost.Instance.StartCoroutine(EnsureMenuInteractableCoroutine(_pauseMenuManager));
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.Warn($"[SubmitLater] Could not ensure menu interactable: {ex.Message}");
+                        }
+
+
                         // Focus the Continue button for better UX
                         try
                         {
@@ -268,6 +280,82 @@ namespace SubmitLater.HarmonyPatches
                 ClearPauseGate();
                 return true; // Always allow through on error
             }
+
         }
+        private static IEnumerator EnsureMenuInteractableCoroutine(PauseMenuManager pauseMenuManager)
+        {
+            // Wait one frame for UI to initialize
+            yield return null;
+
+            try
+            {
+                // Find the pause menu's Canvas and ensure raycasting is enabled
+                var canvas = pauseMenuManager.GetComponentInParent<Canvas>();
+                if (canvas != null)
+                {
+                    // Ensure GraphicRaycaster exists and is enabled
+                    var raycaster = canvas.GetComponent<GraphicRaycaster>();
+                    if (raycaster == null)
+                    {
+                        raycaster = canvas.gameObject.AddComponent<GraphicRaycaster>();
+                        Plugin.Log.Debug("[SubmitLater] Added GraphicRaycaster to pause menu canvas");
+                    }
+                    raycaster.enabled = true;
+
+                    // Ensure canvas is set to highest sort order to be on top
+                    canvas.sortingOrder = 100;
+                    Plugin.Log.Debug($"[SubmitLater] Canvas sort order set to {canvas.sortingOrder}");
+                }
+
+                // Ensure CanvasGroup allows interaction
+                var canvasGroup = pauseMenuManager.GetComponent<CanvasGroup>();
+                if (canvasGroup == null)
+                {
+                    canvasGroup = pauseMenuManager.GetComponentInParent<CanvasGroup>();
+                }
+
+                if (canvasGroup != null)
+                {
+                    canvasGroup.interactable = true;
+                    canvasGroup.blocksRaycasts = true;
+                    Plugin.Log.Debug("[SubmitLater] CanvasGroup set to interactable");
+                }
+
+                // Find and focus the Continue button
+                var allButtons = pauseMenuManager.GetComponentsInChildren<Button>(true);
+                var continueButton = allButtons.FirstOrDefault(b => b.name == "ContinueButton");
+
+                if (continueButton != null)
+                {
+                    // Ensure button is enabled
+                    continueButton.interactable = true;
+
+                    // Clear and set selection
+                    if (EventSystem.current != null)
+                    {
+                        EventSystem.current.SetSelectedGameObject(null);
+                        
+                        EventSystem.current.SetSelectedGameObject(continueButton.gameObject);
+                        Plugin.Log.Debug("[SubmitLater] Continue button focused and interactable");
+                    }
+                }
+
+                // Extra: Force raycast target on all buttons
+                foreach (var btn in allButtons)
+                {
+                    if (btn != null && btn.targetGraphic != null)
+                    {
+                        btn.targetGraphic.raycastTarget = true;
+                    }
+                }
+
+                Plugin.Log.Info("[SubmitLater] Pause menu interaction setup complete");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error($"[SubmitLater] Error in EnsureMenuInteractableCoroutine: {ex}");
+            }
+        }
+
     }
 }

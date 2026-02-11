@@ -10,7 +10,7 @@ namespace SubmitLater.Gameplay
     {
         private static PlayFirstSubmitLaterManager _instance;
         private static GameObject _go;
-        private const string SubmissionKey = "SubmitLater: SubmitLater";
+        private const string SubmissionKey = "SubmitLater Disable";
 
         // Feature state
         private bool _submissionDisabled = false;
