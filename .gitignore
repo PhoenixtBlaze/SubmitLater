@@ -360,7 +360,7 @@ MigrationBackup/
 .ionide/
 
 # Fody - auto-generated XML schema
+/BSDC/
 FodyWeavers.xsd
 /SubmitLater/Submit Later Codes.txt
 /SubmitLater/Dump-Code.ps1
-/DecompiledBeatSaberCodes(DO NOT EDIT)/
