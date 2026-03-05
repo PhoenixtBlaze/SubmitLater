@@ -128,7 +128,7 @@ namespace SubmitLater.Gameplay
             bool isBSPlus = IsBSPlusMultiplayerActive();
             Plugin.Log.Info($"PlayFirstSubmitLater: Map Started. Mode Check -> NativeMP: {isNative}, BS+MP: {isBSPlus}");
 
-            // FORCE ENABLE if in ANY Multiplayer mode
+            // FORCE ENABLE if in ANY Multiplayer mode 
             if (isNative || isBSPlus)
             {
                 Plugin.Log.Info("PlayFirstSubmitLater: Multiplayer detected. Forcing submission ON.");

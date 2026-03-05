@@ -1,10 +1,8 @@
 ﻿using HarmonyLib;
 using System;
 using System.Linq;
-using System.Collections;
+using System.Reflection;
 using UnityEngine;
-using UnityEngine.UI;
-using UnityEngine.EventSystems;
 
 namespace SubmitLater.HarmonyPatches
 {
@@ -28,6 +26,124 @@ namespace SubmitLater.HarmonyPatches
         private static StandardLevelScenesTransitionSetupDataSO _pendingSetup;
         private static LevelCompletionResults _pendingResults;
         private static PauseMenuManager _pauseMenuManager;
+
+        // PauseController private members (reflected for robust end-of-level pause behavior)
+        private static readonly FieldInfo PauseControllerPauseMenuManagerField =
+            AccessTools.Field(typeof(PauseController), "_pauseMenuManager");
+        private static readonly FieldInfo PauseControllerGamePauseField =
+            AccessTools.Field(typeof(PauseController), "_gamePause");
+        private static readonly FieldInfo PauseControllerBeatmapObjectManagerField =
+            AccessTools.Field(typeof(PauseController), "_beatmapObjectManager");
+        private static readonly FieldInfo PauseControllerPausedField =
+            AccessTools.Field(typeof(PauseController), "_paused");
+        private static readonly FieldInfo PauseControllerPauseChangedStateTimeField =
+            AccessTools.Field(typeof(PauseController), "_pauseChangedStateTime");
+        private static readonly FieldInfo PauseControllerDidPauseEventField =
+            AccessTools.Field(typeof(PauseController), "didPauseEvent");
+
+        private static PauseController FindPauseController()
+        {
+            var allControllers = Resources.FindObjectsOfTypeAll<PauseController>();
+            return allControllers.FirstOrDefault(pc =>
+                pc != null &&
+                pc.gameObject != null &&
+                pc.gameObject.scene.IsValid() &&
+                pc.gameObject.scene.isLoaded &&
+                pc.gameObject.activeInHierarchy) ?? allControllers.FirstOrDefault();
+        }
+
+        private static PauseMenuManager ResolvePauseMenuManager(PauseController pauseController)
+        {
+            if (pauseController != null && PauseControllerPauseMenuManagerField != null)
+            {
+                var fromPauseController = PauseControllerPauseMenuManagerField.GetValue(pauseController) as PauseMenuManager;
+                if (fromPauseController != null)
+                    return fromPauseController;
+            }
+
+            var allPauseMenus = Resources.FindObjectsOfTypeAll<PauseMenuManager>();
+            return allPauseMenus.FirstOrDefault(pm =>
+                pm != null &&
+                pm.gameObject != null &&
+                pm.gameObject.scene.IsValid() &&
+                pm.gameObject.scene.isLoaded &&
+                pm.gameObject.activeInHierarchy) ?? allPauseMenus.FirstOrDefault();
+        }
+
+        private static void ForcePauseControllerState(PauseController pauseController)
+        {
+            if (pauseController == null)
+                return;
+
+            try
+            {
+                if (PauseControllerPauseChangedStateTimeField != null &&
+                    PauseControllerPauseChangedStateTimeField.FieldType == typeof(float))
+                {
+                    PauseControllerPauseChangedStateTimeField.SetValue(pauseController, Time.realtimeSinceStartup);
+                }
+
+                if (PauseControllerPausedField == null)
+                    return;
+
+                if (PauseControllerPausedField.FieldType == typeof(bool))
+                {
+                    PauseControllerPausedField.SetValue(pauseController, true);
+                    return;
+                }
+
+                if (PauseControllerPausedField.FieldType.IsEnum)
+                {
+                    var pausedState = Enum.Parse(PauseControllerPausedField.FieldType, "Paused");
+                    PauseControllerPausedField.SetValue(pauseController, pausedState);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Warn($"[SubmitLater] Failed to force PauseController state: {ex.Message}");
+            }
+        }
+
+        private static bool TryShowPauseMenuWithProperPause(PauseController pauseController, PauseMenuManager pauseMenuManager)
+        {
+            if (pauseController == null || pauseMenuManager == null)
+                return false;
+
+            var gamePause = PauseControllerGamePauseField?.GetValue(pauseController) as IGamePause;
+            var beatmapObjectManager = PauseControllerBeatmapObjectManagerField?.GetValue(pauseController) as BeatmapObjectManager;
+
+            // Normal pause path (preferred)
+            pauseController.Pause();
+            if (gamePause != null && gamePause.isPaused)
+                return true;
+            if (gamePause == null && pauseMenuManager.isActiveAndEnabled)
+                return true;
+            if (gamePause == null)
+            {
+                Plugin.Log.Warn("[SubmitLater] Could not access IGamePause from PauseController");
+                return false;
+            }
+
+            // End-of-level path: PauseController can reject Pause() when gameplay state is Finished.
+            Plugin.Log.Info("[SubmitLater] PauseController refused Pause() at level end, forcing full pause state");
+
+            ForcePauseControllerState(pauseController);
+            gamePause.Pause();
+            pauseMenuManager.ShowMenu();
+
+            if (beatmapObjectManager != null)
+            {
+                beatmapObjectManager.HideAllBeatmapObjects(hide: true);
+                beatmapObjectManager.PauseAllBeatmapObjects(pause: true);
+            }
+
+            if (PauseControllerDidPauseEventField?.GetValue(pauseController) is Action didPauseEvent)
+            {
+                didPauseEvent.Invoke();
+            }
+
+            return gamePause.isPaused && pauseMenuManager.isActiveAndEnabled;
+        }
 
         /// <summary>
         /// Determines if the pause gate should activate based on settings and level state.
@@ -205,11 +321,9 @@ namespace SubmitLater.HarmonyPatches
                     // Clean up any existing listeners
                     CleanupPauseListeners();
 
-                    // Find pause menu components
-                    var pauseMenuManager = Resources.FindObjectsOfTypeAll<PauseMenuManager>()
-                        .FirstOrDefault();
-                    var pauseController = Resources.FindObjectsOfTypeAll<PauseController>()
-                        .FirstOrDefault();
+                    // Find pause components from active gameplay scene
+                    var pauseController = FindPauseController();
+                    var pauseMenuManager = ResolvePauseMenuManager(pauseController);
 
                     if (pauseMenuManager != null && pauseController != null)
                     {
@@ -226,39 +340,14 @@ namespace SubmitLater.HarmonyPatches
                         _pauseMenuManager.didPressMenuButtonEvent += _menuDelegate;
                         _pauseMenuManager.didPressRestartButtonEvent += _restartDelegate;
 
-                        // Pause the game and show menu
-                        pauseController.Pause();
-                        _pauseMenuManager.ShowMenu();
+                        if (!TryShowPauseMenuWithProperPause(pauseController, _pauseMenuManager))
+                        {
+                            Plugin.Log.Warn("[SubmitLater] Failed to enter a stable pause state, allowing Finish()");
+                            ClearPauseGate();
+                            return true;
+                        }
 
                         Plugin.Log.Info("[SubmitLater] Pause menu shown - waiting for user input");
-
-                        try
-                        {
-                            // Wait one frame for menu to fully initialize
-                            _ = Gameplay.CoroutineHost.Instance.StartCoroutine(EnsureMenuInteractableCoroutine(_pauseMenuManager));
-                        }
-                        catch (Exception ex)
-                        {
-                            Plugin.Log.Warn($"[SubmitLater] Could not ensure menu interactable: {ex.Message}");
-                        }
-
-
-                        // Focus the Continue button for better UX
-                        try
-                        {
-                            var allButtons = _pauseMenuManager.GetComponentsInChildren<Button>(true);
-                            var continueButton = allButtons.FirstOrDefault(b => b.name == "ContinueButton");
-
-                            if (continueButton != null && EventSystem.current != null)
-                            {
-                                EventSystem.current.SetSelectedGameObject(continueButton.gameObject);
-                                Plugin.Log.Debug("[SubmitLater] Continue button focused");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Plugin.Log.Warn($"[SubmitLater] Could not focus Continue button: {ex.Message}");
-                        }
 
                         // Block the original Finish() call
                         return false;
@@ -279,81 +368,6 @@ namespace SubmitLater.HarmonyPatches
                 Plugin.Log.Error($"[SubmitLater] Error in Harmony Prefix: {ex}");
                 ClearPauseGate();
                 return true; // Always allow through on error
-            }
-
-        }
-        private static IEnumerator EnsureMenuInteractableCoroutine(PauseMenuManager pauseMenuManager)
-        {
-            // Wait one frame for UI to initialize
-            yield return null;
-
-            try
-            {
-                // Find the pause menu's Canvas and ensure raycasting is enabled
-                var canvas = pauseMenuManager.GetComponentInParent<Canvas>();
-                if (canvas != null)
-                {
-                    // Ensure GraphicRaycaster exists and is enabled
-                    var raycaster = canvas.GetComponent<GraphicRaycaster>();
-                    if (raycaster == null)
-                    {
-                        raycaster = canvas.gameObject.AddComponent<GraphicRaycaster>();
-                        Plugin.Log.Debug("[SubmitLater] Added GraphicRaycaster to pause menu canvas");
-                    }
-                    raycaster.enabled = true;
-
-                    // Ensure canvas is set to highest sort order to be on top
-                    canvas.sortingOrder = 100;
-                    Plugin.Log.Debug($"[SubmitLater] Canvas sort order set to {canvas.sortingOrder}");
-                }
-
-                // Ensure CanvasGroup allows interaction
-                var canvasGroup = pauseMenuManager.GetComponent<CanvasGroup>();
-                if (canvasGroup == null)
-                {
-                    canvasGroup = pauseMenuManager.GetComponentInParent<CanvasGroup>();
-                }
-
-                if (canvasGroup != null)
-                {
-                    canvasGroup.interactable = true;
-                    canvasGroup.blocksRaycasts = true;
-                    Plugin.Log.Debug("[SubmitLater] CanvasGroup set to interactable");
-                }
-
-                // Find and focus the Continue button
-                var allButtons = pauseMenuManager.GetComponentsInChildren<Button>(true);
-                var continueButton = allButtons.FirstOrDefault(b => b.name == "ContinueButton");
-
-                if (continueButton != null)
-                {
-                    // Ensure button is enabled
-                    continueButton.interactable = true;
-
-                    // Clear and set selection
-                    if (EventSystem.current != null)
-                    {
-                        EventSystem.current.SetSelectedGameObject(null);
-                        
-                        EventSystem.current.SetSelectedGameObject(continueButton.gameObject);
-                        Plugin.Log.Debug("[SubmitLater] Continue button focused and interactable");
-                    }
-                }
-
-                // Extra: Force raycast target on all buttons
-                foreach (var btn in allButtons)
-                {
-                    if (btn != null && btn.targetGraphic != null)
-                    {
-                        btn.targetGraphic.raycastTarget = true;
-                    }
-                }
-
-                Plugin.Log.Info("[SubmitLater] Pause menu interaction setup complete");
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Error($"[SubmitLater] Error in EnsureMenuInteractableCoroutine: {ex}");
             }
         }
 
